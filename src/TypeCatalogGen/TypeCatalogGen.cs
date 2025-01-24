@@ -175,7 +175,11 @@ DUPLICATE key '{fullName}' from '{strongAssemblyName}' (IsObsolete? {isTypeObsol
                     // Attribute is defined in the same module
                     MethodDefinition methodDef = reader.GetMethodDefinition((MethodDefinitionHandle)customAttribute.Constructor);
                     TypeDefinitionHandle declaringTypeDefHandle = methodDef.GetDeclaringType();
-                    if (declaringTypeDefHandle.IsNil) { /* Global method */ return false; }
+                    if (declaringTypeDefHandle.IsNil)
+                    {
+                        // Global method
+                        return false;
+                    }
 
                     TypeDefinition declaringTypeDef = reader.GetTypeDefinition(declaringTypeDefHandle);
                     attributeFullName = GetTypeFullName(reader, declaringTypeDef);
@@ -230,9 +234,6 @@ DUPLICATE key '{fullName}' from '{strongAssemblyName}' (IsObsolete? {isTypeObsol
             {
                 case AssemblyHashAlgorithm.Sha1:
                     hashImpl = SHA1.Create();
-                    break;
-                case AssemblyHashAlgorithm.MD5:
-                    hashImpl = MD5.Create();
                     break;
                 case AssemblyHashAlgorithm.Sha256:
                     hashImpl = SHA256.Create();
