@@ -17,8 +17,15 @@ if(Test-Path $dotNetPath)
 
 # import build into the global scope so it can be used by packaging
 # argumentList $true says ignore tha we may not be able to build
-Import-Module (Join-Path $repoRoot 'build.psm1') -Verbose -Scope Global -ArgumentList $true
-Import-Module (Join-Path $repoRoot 'tools\packaging') -Verbose -Scope Global
+Write-Verbose "Importing build.psm1" -Verbose
+Import-Module (Join-Path $repoRoot 'build.psm1') -Scope Global -ArgumentList $true
+$buildCommands = Get-Command -Module build
+Write-Verbose "Imported build.psm1 commands: $($buildCommands.Count)" -Verbose
+
+Write-Verbose "Importing packaging.psm1" -Verbose
+Import-Module (Join-Path $repoRoot 'tools\packaging') -Scope Global
+$packagingCommands = Get-Command -Module packaging
+Write-Verbose "Imported packaging.psm1 commands: $($packagingCommands.Count)" -Verbose
 
 # import the windows specific functcion only in Windows PowerShell or on Windows
 if($PSVersionTable.PSEdition -eq 'Desktop' -or $IsWindows)
@@ -105,7 +112,7 @@ function Invoke-CIBuild
         Start-PSBuild -Configuration 'CodeCoverage' -PSModuleRestore -CI -ReleaseTag $releaseTag
     }
 
-    Start-PSBuild -PSModuleRestore -Configuration 'Release' -CI -ReleaseTag $releaseTag
+    Start-PSBuild -PSModuleRestore -Configuration 'Release' -CI -ReleaseTag $releaseTag -UseNuGetOrg
     Save-PSOptions
 
     $options = (Get-PSOptions)
@@ -128,6 +135,10 @@ function Invoke-CIInstall
         [switch]
         $SkipUser
     )
+
+    # Switch to public sources in CI
+    Switch-PSNugetConfig -Source Public
+
     # Make sure we have all the tags
     Sync-PSTags -AddRemoteIfMissing
 
@@ -220,8 +231,11 @@ function Invoke-CITest
         [string] $Purpose,
         [ValidateSet('CI', 'Others')]
         [string] $TagSet,
-        [string] $TitlePrefix
+        [string] $TitlePrefix,
+        [string] $OutputFormat = "NUnitXml"
     )
+
+    Write-Verbose -Verbose "CI test: OutputFormat: $OutputFormat"
 
     # Set locale correctly for Linux CIs
     Set-CorrectLocale
@@ -245,7 +259,7 @@ function Invoke-CITest
 
     if($IsLinux -or $IsMacOS)
     {
-        return Invoke-LinuxTestsCore -Purpose $Purpose -ExcludeTag $ExcludeTag -TagSet $TagSet -TitlePrefix $TitlePrefix
+        return Invoke-LinuxTestsCore -Purpose $Purpose -ExcludeTag $ExcludeTag -TagSet $TagSet -TitlePrefix $TitlePrefix -OutputFormat $OutputFormat
     }
 
     # CoreCLR
@@ -277,12 +291,14 @@ function Invoke-CITest
             Terse = $true
             Tag = @()
             ExcludeTag = $ExcludeTag + 'RequireAdminOnWindows'
+            OutputFormat = $OutputFormat
         }
 
         $title = "Pester Unelevated - $TagSet"
         if ($TitlePrefix) {
             $title = "$TitlePrefix - $title"
         }
+        Write-Verbose -Verbose "Starting Pester with output format $($arguments.OutputFormat)"
         Start-PSPester @arguments -Title $title
 
         # Fail the build, if tests failed
@@ -310,7 +326,10 @@ function Invoke-CITest
             if ($TitlePrefix) {
                 $title = "$TitlePrefix - $title"
             }
-            Start-PSPester @arguments -Title $title
+
+            # We just built the test tools, we don't need to rebuild them
+            Write-Verbose -Verbose "Starting Pester with output format $($arguments.OutputFormat)"
+            Start-PSPester @arguments -Title $title -SkipTestToolBuild
 
             # Fail the build, if tests failed
             Test-PSPesterResults -TestResultsFile $expFeatureTestResultFile
@@ -324,12 +343,15 @@ function Invoke-CITest
             OutputFile = $testResultsAdminFile
             Tag = @('RequireAdminOnWindows')
             ExcludeTag = $ExcludeTag
+            OutputFormat = $OutputFormat
         }
 
         $title = "Pester Elevated - $TagSet"
         if ($TitlePrefix) {
             $title = "$TitlePrefix - $title"
         }
+
+        Write-Verbose -Verbose "Starting Pester with output format $($arguments.OutputFormat)"
         Start-PSPester @arguments -Title $title
 
         # Fail the build, if tests failed
@@ -360,7 +382,10 @@ function Invoke-CITest
             if ($TitlePrefix) {
                 $title = "$TitlePrefix - $title"
             }
-            Start-PSPester @arguments -Title $title
+
+            Write-Verbose -Verbose "Starting Pester with output format $($arguments.OutputFormat)"
+            # We just built the test tools, we don't need to rebuild them
+            Start-PSPester @arguments -Title $title -SkipTestToolBuild
 
             # Fail the build, if tests failed
             Test-PSPesterResults -TestResultsFile $expFeatureTestResultFile
@@ -433,6 +458,18 @@ function Push-Artifact
     if ($env:TF_BUILD) {
         # In Azure DevOps
         Write-Host "##vso[artifact.upload containerfolder=$artifactName;artifactname=$artifactName;]$Path"
+    } elseif ($env:GITHUB_WORKFLOW -and $env:RUNNER_WORKSPACE) {
+        # In GitHub Actions
+        $destinationPath = Join-Path -Path $env:RUNNER_WORKSPACE -ChildPath $artifactName
+
+        # Create the folder if it does not exist
+        if (!(Test-Path -Path $destinationPath)) {
+            $null = New-Item -ItemType Directory -Path $destinationPath -Force
+        }
+
+        Copy-Item -Path $Path -Destination $destinationPath -Force -Verbose
+    } else {
+        Write-Warning "Push-Artifact is not supported in this environment."
     }
 }
 
@@ -479,6 +516,9 @@ function Invoke-CIFinish
         [Validateset('Build','Package')]
         [string[]] $Stage = ('Build','Package')
     )
+
+    # Switch to public sources in CI
+    Switch-PSNugetConfig -Source Public
 
     if ($PSEdition -eq 'Core' -and ($IsLinux -or $IsMacOS) -and $Stage -contains 'Build') {
         return New-LinuxPackage
@@ -537,13 +577,16 @@ function Invoke-CIFinish
             switch -regex ($Runtime){
                 default {
                     $runPackageTest = $true
-                    $packageTypes = 'msi', 'nupkg', 'zip', 'zip-pdb', 'msix'
+                    $packageTypes = 'msi', 'zip', 'zip-pdb', 'msix'
                 }
                 'win-arm.*' {
                     $runPackageTest = $false
-                    $packageTypes = 'zip', 'zip-pdb', 'msix'
+                    $packageTypes = 'msi', 'zip', 'zip-pdb', 'msix'
                 }
             }
+
+            Import-Module "$PSScriptRoot\wix\wix.psm1"
+            Install-Wix -arm64:$true
             $packages = Start-PSPackage -Type $packageTypes -ReleaseTag $preReleaseVersion -SkipReleaseChecks -WindowsRuntime $Runtime
 
             foreach ($package in $packages) {
@@ -589,14 +632,6 @@ function Invoke-CIFinish
                     throw "Packaging tests failed ($($packagingTestResult.FailedCount) failed/$($packagingTestResult.PassedCount) passed)"
                 }
             }
-
-            # only publish assembly nuget packages if it is a daily build and tests passed
-            if (Test-DailyBuild) {
-                $nugetArtifacts = Get-ChildItem $PSScriptRoot\packaging\nugetOutput -ErrorAction SilentlyContinue -Filter *.nupkg | Select-Object -ExpandProperty FullName
-                if ($nugetArtifacts) {
-                    $artifacts.AddRange(@($nugetArtifacts))
-                }
-            }
         }
     } catch {
         Get-Error -InputObject $_
@@ -620,6 +655,35 @@ function Invoke-CIFinish
     }
 }
 
+function Set-Path
+{
+    param
+    (
+        [Parameter(Mandatory)]
+        [string]
+        $Path,
+
+        [Parameter(Mandatory)]
+        [switch]
+        $Append
+    )
+
+    $machinePathString = [System.Environment]::GetEnvironmentVariable('path',[System.EnvironmentVariableTarget]::Machine)
+    $machinePath = $machinePathString -split ';'
+
+    if($machinePath -inotcontains $path)
+    {
+        $newPath = "$machinePathString;$path"
+        Write-Verbose "Adding $path to path..." -Verbose
+        [System.Environment]::SetEnvironmentVariable('path',$newPath,[System.EnvironmentVariableTarget]::Machine)
+        Write-Verbose "Added $path to path." -Verbose
+    }
+    else
+    {
+        Write-Verbose "$path already in path." -Verbose
+    }
+}
+
 # Bootstrap script for Linux and macOS
 function Invoke-BootstrapStage
 {
@@ -639,7 +703,8 @@ function Invoke-LinuxTestsCore
         [string] $Purpose = 'All',
         [string[]] $ExcludeTag = @('Slow', 'Feature', 'Scenario'),
         [string] $TagSet = 'CI',
-        [string] $TitlePrefix
+        [string] $TitlePrefix,
+        [string] $OutputFormat = "NUnitXml"
     )
 
     $output = Split-Path -Parent (Get-PSOutput -Options (Get-PSOptions))
@@ -652,12 +717,13 @@ function Invoke-LinuxTestsCore
     $sudoResultsWithExpFeatures = $null
 
     $noSudoPesterParam = @{
-        'BinDir'     = $output
-        'PassThru'   = $true
-        'Terse'      = $true
-        'Tag'        = @()
-        'ExcludeTag' = $testExcludeTag
-        'OutputFile' = $testResultsNoSudo
+        'BinDir'       = $output
+        'PassThru'     = $true
+        'Terse'        = $true
+        'Tag'          = @()
+        'ExcludeTag'   = $testExcludeTag
+        'OutputFile'   = $testResultsNoSudo
+        'OutputFormat' = $OutputFormat
     }
 
     # Get the experimental feature names and the tests associated with them
@@ -695,7 +761,7 @@ function Invoke-LinuxTestsCore
             if ($TitlePrefix) {
                 $title = "$TitlePrefix - $title"
             }
-            $passThruResult = Start-PSPester @noSudoPesterParam -Title $title
+            $passThruResult = Start-PSPester @noSudoPesterParam -Title $title -SkipTestToolBuild
 
             $noSudoResultsWithExpFeatures += $passThruResult
         }
@@ -710,6 +776,7 @@ function Invoke-LinuxTestsCore
         $sudoPesterParam['ExcludeTag'] = $ExcludeTag
         $sudoPesterParam['Sudo'] = $true
         $sudoPesterParam['OutputFile'] = $testResultsSudo
+        $sudoPesterParam['OutputFormat'] = $OutputFormat
 
         $title = "Pester Sudo - $TagSet"
         if ($TitlePrefix) {
@@ -742,7 +809,9 @@ function Invoke-LinuxTestsCore
             if ($TitlePrefix) {
                 $title = "$TitlePrefix - $title"
             }
-            $passThruResult = Start-PSPester @sudoPesterParam -Title $title
+
+            # We just built the test tools for the main test run, we don't need to rebuild them
+            $passThruResult = Start-PSPester @sudoPesterParam -Title $title -SkipTestToolBuild
 
             $sudoResultsWithExpFeatures += $passThruResult
         }
@@ -784,7 +853,7 @@ function New-LinuxPackage
 
     # Only build packages for PowerShell/PowerShell repository
     # branches, not pull requests
-    $packages = @(Start-PSPackage @packageParams -SkipReleaseChecks -Type deb, rpm, tar)
+    $packages = @(Start-PSPackage @packageParams -SkipReleaseChecks -Type deb, rpm, rpm-fxdependent-arm64, tar)
     foreach($package in $packages)
     {
         if (Test-Path $package)
@@ -832,9 +901,15 @@ function Invoke-InitializeContainerStage {
 
     # For PRs set the seed to the PR number so that the image is always the same
     $seed = $env:SYSTEM_PULLREQUEST_PULLREQUESTID
+
     if(!$seed) {
       # for non-PRs use the integer identifier of the build as the seed.
       $seed = $fallbackSeed
+    }
+
+    # cut down to 32 bits and keep the most varying parts, which are lower bits
+    if ($seed -ge [Int32]::MaxValue) {
+        $seed = [int]($seed -band [int]::MaxValue)
     }
 
     Write-Verbose "Seed: $seed" -Verbose
